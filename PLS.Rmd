@@ -1,0 +1,1423 @@
+---
+title: "PLS"
+output: html_document
+---
+
+```{r setup, include=TRUE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+library(tximeta)
+library(tidyverse)
+library(pheatmap)
+library(viridis)
+library(RColorBrewer)
+library(ggrepel)
+library(ggplot2)
+library(hexbin)
+library(genefilter)
+library(SummarizedExperiment)
+library(DESeq2)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(repr)
+library(xtable)
+library(writexl)
+library(ggpubr)
+library(limma)
+library(EnhancedVolcano)
+```
+
+### Create index
+
+An index is generated with files from: [Index files](https://www.gencodegenes.org/human/). The following code were used in the ubuntu system to download the most recent files: 
+```{r eval=FALSE, echo=TRUE}
+wget ftp://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_37/gencode.v37.transcripts.fa.gz
+wget ftp://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_37/GRCh38.primary_assembly.genome.fa.gz
+```
+
+Metadata is prepared:
+```{r eval=FALSE, echo=TRUE}
+grep "^>" <(gunzip -c GRCh38.primary_assembly.genome.fa.gz) | cut -d " " -f 1 > decoys.txt
+sed -i.bak -e 's/>//g' decoys.txt
+```
+
+The transcriptome and genome are concatenated:
+```{r eval=FALSE, echo=TRUE}
+cat gencode.v37.transcripts.fa.gz GRCh38.primary_assembly.genome.fa.gz > gentrome.fa.gz
+```
+
+##### Index command:[^1]
+
+The decoy-aware index is created using salmon:
+```{r eval=FALSE, echo=TRUE}
+salmon index -t gentrome.fa.gz -d decoys.txt -p 12 -i salmon_index --gencode
+```
+
+[Prebuild index can be found here](http://refgenomes.databio.org/v2/asset/hg38/salmon_sa_index/splash?tag=default)
+
+[^1]: [Site for index knowlegde](https://combine-lab.github.io/alevin-tutorial/2019/selective-alignment/)
+
+### FastQC
+
+The following command was passed to the ubuntu system and generated FastQC files for each fastq file:
+```{r eval=FALSE, echo=TRUE}
+fastqc /*.fastq.gz -o /FastQC_reports
+```
+
+### Mapping
+
+After FASTQC the following command was passed to the ubuntu system for selective alignment (SA) mapping:
+```{r eval=FALSE, echo=TRUE}
+for i in $(ls / | sed s/_R1.fastq.gz/ | sort -u | grep -v '_R2'); do echo ${i}; salmon quant -i /salmon_index  --libType A --seqBias -- gcBias  -1 ${i}_R1.fastq.gz -2 ${i}_R2.fastq.gz -o Salmon_output/${i}; done 
+```
+
+### Data and study design import:
+
+From Salmon transcripts/isoforms can be extracted with *tximeta* and combined with the study design data. Firstly, the file paths and the metadata er pooled in *coldata*:
+```{r}
+csvfile <-
+  file.path(
+    "~R directory/",
+    "study_design.csv"
+  )
+coldata <- read.csv(csvfile, stringsAsFactors = FALSE)
+coldata$names <- coldata$SampleID
+coldata$files <-
+  file.path(
+    "~/",
+    coldata$names,
+    "quant.sf"
+  )
+
+head(coldata, 35)
+```
+
+The excluded patients/samples are removed from the analysis:
+```{r}
+coldata <- coldata[coldata$Group != "Excluded", ]
+```
+
+The Summarized Experiment object consisting of transcript names, count/abundances, and meta data is created:
+```{r}
+se <- tximeta(coldata)
+dim(se)
+```
+
+233652 transcripts across the 28 samples are summarized to gene level with *tximeta*: 
+```{r message=FALSE}
+gse <- summarizeToGene(se)
+dim(gse)
+```
+
+There is 60232 genes across the 28 samples.
+
+The library sizes of the samples are accessed (shown in millions):
+```{r}
+round(colSums(assay(gse)) / 1e6)
+```
+
+A DESeq2 object with comparisons made across the *Groups* is created. The DESeqDataSet enforces that the values in this matrix are non-negative integers. Thus, the counts from Salmon are rounded up/down from the gse to the dds object:
+```{r warning=FALSE}
+dds <- DESeqDataSet(gse, design = ~ Batch + Intervention + Group)
+dds
+```
+
+In order to reduce the noise in the data, we remove the rows that have no or nearly no information about the amount of gene expression. Here, we remove genes that have no counts, or only a single count across all samples.
+```{r}
+nrow(dds)
+dds <- dds[rowSums(counts(dds)) > 1,]
+nrow(dds)
+```
+
+We likewise remove pseudogenes from the dataset, since they are not of interest to this study:
+```{r}
+ens.str <- substr(rownames(dds), 1, 15)
+ens.str_full <- substr(rownames(dds), 1, 20)
+df_pseudo <-
+  as.data.frame(ens.str) %>% add_column(as.data.frame(ens.str_full))
+df_pseudo$symbol <- mapIds(
+  org.Hs.eg.db,
+  keys = ens.str,
+  column = "SYMBOL",
+  keytype = "ENSEMBL",
+  multiVals = "first"
+)
+df_pseudo <-
+  as_tibble(filter(df_pseudo,!is.na(symbol)))  %>% column_to_rownames("ens.str_full")
+pseudo_remove <- substr(rownames(df_pseudo), 1, 20)
+
+dds <- dds[pseudo_remove, ]
+nrow(dds)
+```
+
+### Exploratory Data Analysis
+
+For exploratory analysis we need to normalize the RNA-seq counts, since clustering and principal components analysis (PCA) work best for homoskedastic data.
+
+##### Normalization:
+We use the algorithm *variance stabilizing transformation* (VST) for negative binomial data with a dispersion-mean trend (Anders and Huber 2010) offered by the DESeq2 package. 
+
+```{r fig.align='center', message=FALSE, warning=FALSE}
+vsd <- vst(dds, blind = FALSE)
+```
+
+##### Sample similarity:
+We study how similar the samples are looking at distance and plot the similarity values using a heatmap and hierarchical clustering to see how samples group/patterns and to potentially spot any outliers, labeling errors, and the like.
+
+```{r}
+sampleDists <- dist(t(assay(vsd)))
+```
+
+```{r, fig.align='center'}
+sampleDistMatrix <- as.matrix(sampleDists)
+rows <- rownames(sampleDistMatrix)
+rownames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette(rev(brewer.pal(9, "Blues")))(255)
+anno <-
+  as.data.frame(colData(vsd)[, c("Group", "Intervention", "BiologicalSex")])
+labels <-  colData(vsd)[, c("ExNumber")]
+annotation_colors <- list(Group = c(
+  Healthy = "#009E73",
+  Cirrhosis = "#FC4E07",
+  NAFLD = "#E7B800"
+))
+pheatmap(
+  sampleDistMatrix,
+  annotation_col = anno,
+  annotation_colors = annotation_colors,
+  labels_col = labels,
+  clustering_distance_rows = sampleDists,
+  clustering_distance_cols = sampleDists,
+  col = colors,
+  main = "Heatmap with hierarchical clustering" ,
+  width = 7,
+  height = 5,
+  angle_col = 90
+)
+```
+
+##### Principal component analysis
+
+PCA plots with all samples are created.
+
+```{r, fig.align='center'}
+pcaData <-
+  plotPCA(
+    vsd,
+    intgroup = c(
+      "Group",
+      "Intervention",
+      "ExNumber",
+      "Batch"
+    ),
+    returnData = TRUE
+  )
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+
+ggplot(pcaData, aes(
+  x = PC1,
+  y = PC2,
+  color = Batch,
+  label = ExNumber
+)) +
+  geom_point(size = 3) +
+  ggrepel::geom_text_repel(max.overlaps = 20) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  coord_fixed() +
+  ggtitle("PCA with VST normalized data") +
+  theme_bw()
+
+ggplot(pcaData,
+       aes(
+         x = PC1,
+         y = PC2,
+         color = Group,
+         shape = Intervention,
+         label = ExNumber
+       )) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("#009E73", "#FC4E07", "#E7B800")) +
+  ggrepel::geom_text_repel(max.overlaps = 20) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  coord_fixed() +
+  ggtitle("PCA with VST normalized data") +
+  theme_bw()
+```
+
+Since the variation for the cirrhosis group is considerably larger than that of the NAFLD group or the healthy group, the cirrhosis samples are removed for a separate analysis of NAFLD vs healthy: 
+
+```{r}
+#Removing the cirrhosis samples:
+coldata_WOcirr <- coldata[coldata$Group != "Cirrhosis",]
+se_WOcirr <- tximeta(coldata_WOcirr)
+dim(se_WOcirr)
+gse_WOcirr <- summarizeToGene(se_WOcirr)
+dim(gse_WOcirr)
+
+dds_WOcirr <- DESeqDataSet(gse_WOcirr, design = ~ Batch + Intervention + Group)
+dds_WOcirr <- dds_WOcirr[ rowSums(counts(dds_WOcirr)) > 1, ]
+dim(dds_WOcirr)
+
+#Removing pseudogenes from the altered dataset:
+ens.str_WOcirr <- substr(rownames(dds_WOcirr), 1, 15)
+ens.str_full_WOcirr <- substr(rownames(dds_WOcirr), 1, 20)
+df_pseudo_WOcirr <- as.data.frame(ens.str_WOcirr) %>% add_column(as.data.frame(ens.str_full_WOcirr))
+df_pseudo_WOcirr$symbol <- mapIds(org.Hs.eg.db,
+                     keys=ens.str_WOcirr,
+                     column="SYMBOL",
+                     keytype="ENSEMBL",
+                     multiVals="first")
+df_pseudo_WOcirr <- as_tibble(filter(df_pseudo_WOcirr, !is.na(symbol))) %>% column_to_rownames("ens.str_full_WOcirr")
+pseudo_remove_WOcirr <- substr(rownames(df_pseudo_WOcirr), 1, 20)
+
+dds_WOcirr <- dds_WOcirr[pseudo_remove_WOcirr,]
+dim(dds_WOcirr)
+```
+
+PCA plots are made for the dataset without the cirrhosis patients:
+```{r}
+vsd_WOcirr <- vst(dds_WOcirr, blind = FALSE)
+
+pcaData_WOcirr <-
+  plotPCA(
+    vsd_WOcirr,
+    intgroup = c(
+      "Group",
+      "Intervention",
+      "ExNumber",
+      "Batch"
+    ),
+    returnData = TRUE
+  )
+percentVar_WOcirr <- round(100 * attr(pcaData_WOcirr, "percentVar"))
+
+ggplot(pcaData_WOcirr, aes(
+         x = PC1,
+         y = PC2,
+         color = Batch,
+         shape = Group,
+         label = ExNumber
+       )) +
+  geom_point(size = 3) +
+  ggrepel::geom_text_repel(max.overlaps = 20) +
+  xlab(paste0("PC1: ", percentVar_WOcirr[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar_WOcirr[2], "% variance")) +
+  coord_fixed() +
+  ggtitle("PCA with VST normalized data") +
+  theme_bw()
+
+ggplot(pcaData_WOcirr, 
+       aes(
+         x = PC1,
+         y = PC2,
+         color = Group,
+         shape = Intervention,
+         label = ExNumber
+       )) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("#FC4E07", "#E7B800")) +
+  ggrepel::geom_text_repel(max.overlaps = 20) +
+  xlab(paste0("PC1: ", percentVar_WOcirr[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar_WOcirr[2], "% variance")) +
+  coord_fixed() +
+  ggtitle("PCA with VST normalized data") +
+  theme_bw()
+```
+
+In the design, we are correcting for differences in sequencing runs/RNA isolation. The PCA plots are plotted incorporating this correction:
+Firstly, the PCA with all samples:
+
+```{r}
+mat <- assay(vsd)
+mm <- model.matrix(~ Intervention + Group, colData(vsd))
+mat <- limma::removeBatchEffect(mat, batch=vsd$Batch, design=mm) 
+assay(vsd) <- mat
+
+pcaData_batch_dds <-
+  plotPCA(
+    vsd,
+    intgroup = c(
+      "Group",
+      "Intervention",
+      "ExNumber",
+      "Batch"
+    ),
+    returnData = TRUE
+  )
+percentVar_WOcirr <- round(100 * attr(pcaData_batch_dds, "percentVar"))
+
+ggplot(pcaData_batch_dds, aes(
+         x = PC1,
+         y = PC2,
+         color = Batch,
+         shape = Group,
+         label = ExNumber
+       )) +
+  geom_point(size = 3) +
+  ggrepel::geom_text_repel(max.overlaps = 20) +
+  xlab(paste0("PC1: ", percentVar_WOcirr[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar_WOcirr[2], "% variance")) +
+  coord_fixed() +
+  ggtitle("PCA with VST normalized data") +
+  theme_bw()
+
+pcaData_batch_dds$Group <- factor(pcaData_batch_dds$Group, levels = c("Cirrhosis", "NAFLD", "Healthy"))
+ggplot(pcaData_batch_dds,
+       aes(
+         x = PC1,
+         y = PC2,
+         color = Group,
+         shape = Intervention
+       )) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("darkred", "orange", "black")) +
+  scale_shape_manual(values=c(16, 17)) +
+  xlab(paste0("PC1: ", percentVar_WOcirr[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar_WOcirr[2], "% variance")) +
+  coord_fixed() +
+  theme_bw() +
+  theme(legend.position="top") +
+  theme(legend.title = element_blank())
+```
+Secondly, the PCA plots where cirrhosis is excluded are made: 
+
+```{r}
+mat <- assay(vsd_WOcirr)
+mm <- model.matrix(~ Intervention + Group, colData(vsd_WOcirr))
+mat <- limma::removeBatchEffect(mat, batch=vsd_WOcirr$Batch, design=mm) 
+assay(vsd_WOcirr) <- mat
+
+pcaData_batch_WOcirr <-
+  plotPCA(
+    vsd_WOcirr,
+    intgroup = c(
+      "Group",
+      "Intervention",
+      "ExNumber",
+      "Batch"
+    ),
+    returnData = TRUE
+  )
+percentVar_WOcirr <- round(100 * attr(pcaData_batch_WOcirr, "percentVar"))
+
+ggplot(pcaData_batch_WOcirr, aes(
+         x = PC1,
+         y = PC2,
+         color = Batch,
+         shape = Group,
+         label = ExNumber
+       )) +
+  geom_point(size = 3) +
+  ggrepel::geom_text_repel(max.overlaps = 20) +
+  xlab(paste0("PC1: ", percentVar_WOcirr[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar_WOcirr[2], "% variance")) +
+  coord_fixed() +
+  ggtitle("PCA with VST normalized data") +
+  theme_bw()
+
+pcaData_batch_WOcirr$Group <- factor(pcaData_batch_WOcirr$Group, levels = c("NAFLD", "Healthy"))
+
+ggplot(pcaData_batch_WOcirr,
+       aes(
+         x = PC1,
+         y = PC2,
+         color = Group,
+         shape = Intervention
+       )) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("orange", "black")) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  coord_fixed() +
+  theme_bw() +
+  theme(legend.position="top") +
+  theme(legend.title = element_blank())
+```
+
+### DE analysis
+
+Analysis between each group is made:
+
+```{r}
+dds <- DESeq(dds)
+dds_WOcirr <- DESeq(dds_WOcirr)
+
+NAFLDvsHealthy_WOcirr <- results(dds_WOcirr, contrast=c("Group","NAFLD","Healthy"),
+                    lfcThreshold=0, alpha=0.05)
+CirrvsH <- results(dds, contrast=c("Group","Cirrhosis","Healthy"),
+                    lfcThreshold=0, alpha=0.05)
+CirrvsNAFLD <- results(dds, contrast=c("Group","Cirrhosis","NAFLD"),
+                    lfcThreshold=0, alpha=0.05)
+```
+
+A summery of the analyses are printed:
+
+```{r}
+summary(NAFLDvsHealthy_WOcirr)
+summary(CirrvsH)
+summary(CirrvsNAFLD)
+```
+
+#### DE diagnostic plots
+
+In this section, diagnostic plots are created to ensure that the differential expression analyses are appropriate:
+
+##### Dispersion plot
+
+```{r, fig.align='center'}
+plotDispEsts(dds)
+plotDispEsts(dds_WOcirr)
+```
+
+##### MA plots
+
+```{r fig.align='center', message=FALSE, warning=FALSE}
+NAFLDvsHealthy_WOcirr_tibble <- NAFLDvsHealthy_WOcirr %>%
+  as.data.frame(.) %>%
+  rownames_to_column("ENSEMBL") %>%
+  as_tibble(.)
+
+CirrvsH_tibble <- CirrvsH %>%
+  as.data.frame(.) %>%
+  rownames_to_column("ENSEMBL") %>%
+  as_tibble(.)
+
+CirrvsNAFLD_tibble <- CirrvsNAFLD %>%
+  as.data.frame(.) %>%
+  rownames_to_column("ENSEMBL") %>%
+  as_tibble(.)
+
+ggplot(NAFLDvsHealthy_WOcirr_tibble) +
+  geom_point(aes(x = baseMean, y = log2FoldChange, color = padj < 0.05), alpha = 0.5, size = 1) +
+  geom_smooth(aes(x = baseMean, y = log2FoldChange)) +
+  scale_x_log10() +
+  ylim(-10, 10) +
+  geom_hline(yintercept = 0,alpha = 0.5,color = "red") +
+  labs(title = "MA-plot (NAFLD vs. healthy)",
+       y = "Log2 fold change",
+       x = "Mean of normalized counts") +
+  scale_color_discrete(name = "Adjusted p-value",labels = c("> 0.05","< 0.05","Not tested")) +
+  theme_bw() +
+  theme(legend.position = c(0.95,0.95),
+        legend.justification = c("right","top"), legend.background = element_rect(linetype="solid", colour="black"))
+
+ggplot(CirrvsH_tibble) +
+  geom_point(aes(x = baseMean, y = log2FoldChange, color = padj < 0.05),
+    alpha = 0.5,
+    size = 1) +
+  geom_smooth(aes(x = baseMean, y = log2FoldChange)) +
+  scale_x_log10() +
+  ylim(-10, 10) +
+  geom_hline(yintercept = 0,
+             alpha = 0.5,
+             color = "red") +
+  labs(title = "MA-plot (Cirrhosis vs. healthy)",
+       y = "Log2 fold change",
+       x = "Mean of normalized counts") +
+  scale_color_discrete(name = "Adjusted p-value",
+                       labels = c("> 0.05", "< 0.05", "Not tested")) +
+  theme_bw() +
+  theme(legend.position = c(0.95, 0.95),
+    legend.justification = c("right", "top"),
+    legend.background = element_rect(linetype = "solid",
+                                     colour = "black"))
+
+ggplot(CirrvsNAFLD_tibble) +
+  geom_point(aes(x = baseMean, y = log2FoldChange, color = padj < 0.05),
+    alpha = 0.5,
+    size = 1) +
+  geom_smooth(aes(x = baseMean, y = log2FoldChange)) +
+  scale_x_log10() +
+  ylim(-10, 10) +
+  geom_hline(yintercept = 0,
+             alpha = 0.5,
+             color = "red") +
+  labs(title = "MA-plot (Cirrhosis vs. NAFLD)",
+       y = "Log2 fold change",
+       x = "Mean of normalized counts") +
+  scale_color_discrete(name = "Adjusted p-value",
+                       labels = c("> 0.05", "< 0.05", "Not tested")) +
+  theme_bw() +
+  theme(legend.position = c(0.95, 0.95),
+    legend.justification = c("right", "top"),
+    legend.background = element_rect(linetype = "solid",
+                                     colour = "black")) 
+```
+
+##### P-value plots:
+
+The p-value plots are created were genes with very small average counts are excluded:
+
+```{r, fig.align='center'}
+hist(
+  NAFLDvsHealthy_WOcirr$pvalue[NAFLDvsHealthy_WOcirr$baseMean > 1],
+  breaks = 0:20 / 20,
+  col = "grey50",
+  border = "white",
+  main = "P-value distribution for NAFLD vs Healthy",
+  xlab = "P-value"
+)
+
+hist(
+  CirrvsH$pvalue[CirrvsH$baseMean > 1],
+  breaks = 0:20 / 20,
+  col = "grey50",
+  border = "white",
+  main = "P-value distribution for Cirrhosis vs Healthy",
+  xlab = "P-value"
+)
+
+hist(
+  CirrvsNAFLD$pvalue[CirrvsNAFLD$baseMean > 1],
+  breaks = 0:20 / 20,
+  col = "grey50",
+  border = "white",
+  main = "P-value distribution for Cirrhosis vs NAFLD",
+  xlab = "P-value"
+)
+```
+
+##### Independent filtering plot
+
+```{r fig.align='center', message=FALSE, warning=FALSE}
+ggplot(NAFLDvsHealthy_WOcirr_tibble, aes(x=dense_rank(baseMean), y=-log10(pvalue), color=padj < 0.05)) + 
+  geom_point(alpha=0.5) + 
+  labs(title = "Independent filtering (NAFLD vs. Healthy)",
+       y = "- Log10 p-value",
+       x = "Base mean expression - Ranked") +
+  scale_color_discrete(name = "Adjusted p-value",
+                       labels = c("> 0.05", "< 0.05", "Not tested")) +
+  theme_bw() +
+  theme(legend.position = c(0.05, 0.95),
+    legend.justification = c("left", "top"),
+    legend.background = element_rect(linetype = "solid",
+                                     colour = "black")) 
+
+ggplot(CirrvsH_tibble, aes(x=dense_rank(baseMean), y=-log10(pvalue), color=padj < 0.05)) + 
+  geom_point(alpha=0.5) + 
+  labs(title = "Independent filtering (Cirrhosis vs. Healthy)",
+       y = "- Log10 p-value",
+       x = "Base mean expression - Ranked") +
+  scale_color_discrete(name = "Adjusted p-value",
+                       labels = c("> 0.05", "< 0.05", "Not tested")) +
+  theme_bw() +
+  theme(legend.position = c(0.05, 0.95),
+    legend.justification = c("left", "top"),
+    legend.background = element_rect(linetype = "solid",
+                                     colour = "black"))
+
+ggplot(CirrvsNAFLD_tibble, aes(x=dense_rank(baseMean), y=-log10(pvalue), color=padj < 0.05)) + 
+  geom_point(alpha=0.5) + 
+  labs(title = "Independent filtering (Cirrhosis vs. NAFLD)",
+       y = "- Log10 p-value",
+       x = "Base mean expression - Ranked") +
+  scale_color_discrete(name = "Adjusted p-value",
+                       labels = c("> 0.05", "< 0.05", "Not tested")) +
+  theme_bw() +
+  theme(legend.position = c(0.05, 0.95),
+    legend.justification = c("left", "top"),
+    legend.background = element_rect(linetype = "solid",
+                                     colour = "black"))
+```
+
+#### DE results:
+
+Adding symbols and gene names:
+
+```{r message=FALSE, warning=FALSE}
+ens.str <- substr(rownames(NAFLDvsHealthy_WOcirr), 1, 15)
+NAFLDvsHealthy_WOcirr$symbol <- mapIds(org.Hs.eg.db,
+                     keys=ens.str,
+                     column="SYMBOL",
+                     keytype="ENSEMBL",
+                     multiVals="first")
+NAFLDvsHealthy_WOcirr$gene_id <- mapIds(org.Hs.eg.db,
+                     keys=ens.str,
+                     column="ENTREZID",
+                     keytype="ENSEMBL",
+                     multiVals="first")
+NAFLDvsHealthy_WOcirr$gene_name <- mapIds(org.Hs.eg.db,
+                     keys=ens.str,
+                     column="GENENAME",
+                     keytype="ENSEMBL",
+                     multiVals="first")
+ens.str <- substr(rownames(CirrvsH), 1, 15)
+CirrvsH$symbol <- mapIds(org.Hs.eg.db,
+                     keys=ens.str,
+                     column="SYMBOL",
+                     keytype="ENSEMBL",
+                     multiVals="first")
+CirrvsH$gene_id <- mapIds(org.Hs.eg.db,
+                     keys=ens.str,
+                     column="ENTREZID",
+                     keytype="ENSEMBL",
+                     multiVals="first")
+CirrvsH$gene_name <- mapIds(org.Hs.eg.db,
+                     keys=ens.str,
+                     column="GENENAME",
+                     keytype="ENSEMBL",
+                     multiVals="first")
+
+ens.str <- substr(rownames(CirrvsNAFLD), 1, 15)
+CirrvsNAFLD$symbol <- mapIds(org.Hs.eg.db,
+                     keys=ens.str,
+                     column="SYMBOL",
+                     keytype="ENSEMBL",
+                     multiVals="first")
+CirrvsNAFLD$gene_id <- mapIds(org.Hs.eg.db,
+                     keys=ens.str,
+                     column="ENTREZID",
+                     keytype="ENSEMBL",
+                     multiVals="first")
+CirrvsNAFLD$gene_name <- mapIds(org.Hs.eg.db,
+                     keys=ens.str,
+                     column="GENENAME",
+                     keytype="ENSEMBL",
+                     multiVals="first")
+
+
+NAFLDvsHealthy_WOcirr_tibble <- add_column(NAFLDvsHealthy_WOcirr_tibble,gene_symbol = NAFLDvsHealthy_WOcirr$symbol, .after = "ENSEMBL")
+CirrvsH_tibble <- add_column(CirrvsH_tibble,gene_symbol = CirrvsH$symbol, .after = "ENSEMBL")
+CirrvsNAFLD_tibble <- add_column(CirrvsNAFLD_tibble,gene_symbol = CirrvsNAFLD$symbol, .after = "ENSEMBL")
+
+NAFLDvsHealthy_WOcirr_tibble <- add_column(NAFLDvsHealthy_WOcirr_tibble,gene_name = NAFLDvsHealthy_WOcirr$gene_name, .after = "gene_symbol")
+CirrvsH_tibble <- add_column(CirrvsH_tibble,gene_name = CirrvsH$gene_name, .after = "gene_symbol")
+CirrvsNAFLD_tibble <- add_column(CirrvsNAFLD_tibble,gene_name = CirrvsNAFLD$gene_name, .after = "gene_symbol")
+```
+
+##### Results table
+
+All differentially expressed genes (FDR < 0.05) are saved as *All_Sig_Genes[...].xlsx* and *All_Sig_Genes[...].csv* 
+
+```{r}
+All_Sig_Genes_NAFLDvsH <- arrange(NAFLDvsHealthy_WOcirr_tibble, desc(log2FoldChange)) %>% 
+  filter(., padj < 0.05) %>%
+  mutate(., foldChange = 2^log2FoldChange) 
+
+write_xlsx(All_Sig_Genes_NAFLDvsH, "All_Sig_Genes_NAFLDvsH_WOcirr_SeqCorrected.xlsx")
+write_csv(All_Sig_Genes_NAFLDvsH, "All_Sig_Genes_NAFLDvsH_WOcirr_SeqCorrected.csv")
+```
+
+
+```{r}
+All_Sig_Genes_CirrvsH <- arrange(CirrvsH_tibble, desc(log2FoldChange)) %>% 
+  filter(., padj < 0.05) %>%
+  mutate(., foldChange = 2^log2FoldChange) 
+
+write_xlsx(All_Sig_Genes_CirrvsH, "All_Sig_Genes_CirrvsH_SeqCorrected.xlsx")
+write_csv(All_Sig_Genes_CirrvsH, "All_Sig_Genes_CirrvsH_SeqCorrected.csv")
+```
+
+
+```{r}
+All_Sig_Genes_CirrvsNAFLD <- arrange(CirrvsNAFLD_tibble, desc(log2FoldChange)) %>% 
+  filter(., padj < 0.05) %>%
+  mutate(., foldChange = 2^log2FoldChange) 
+
+write_xlsx(All_Sig_Genes_CirrvsNAFLD, "All_Sig_Genes_CirrvsNAFLD_SeqCorrected.xlsx")
+write_csv(All_Sig_Genes_CirrvsNAFLD, "All_Sig_Genes_CirrvsNAFLD_SeqCorrected.csv")
+```
+
+
+### Gene Ontology 
+
+Gene lists are prepared for analyses:
+
+```{r}
+GO_NAFLDvsH <- NAFLDvsHealthy_WOcirr
+genes_NH <- lapply(rownames(GO_NAFLDvsH), function(x) unlist(strsplit(x,".", fixed=TRUE))[1])
+rownames(GO_NAFLDvsH) <- genes_NH
+resSig_NH <- subset(GO_NAFLDvsH, padj < 0.05)
+resFCordered_NH <-unique(GO_NAFLDvsH[order(GO_NAFLDvsH$log2FoldChange, decreasing = TRUE),])
+sigFCordered_NH <-unique(resSig_NH[order(resSig_NH$log2FoldChange, decreasing = TRUE),])
+
+universe_NH <- resFCordered_NH[,c("log2FoldChange")]
+
+siggenes_NH <- sigFCordered_NH[abs(sigFCordered_NH$log2FoldChange) > 0,c("log2FoldChange")]
+names(universe_NH) <- rownames(resFCordered_NH)
+names(siggenes_NH) <- rownames(sigFCordered_NH[abs(sigFCordered_NH$log2FoldChange) > 0,])
+
+length(universe_NH)
+length(siggenes_NH)
+```
+
+```{r}
+GO_CirrvsH <- CirrvsH
+genes_CH <- lapply(rownames(GO_CirrvsH), function(x) unlist(strsplit(x,".", fixed=TRUE))[1])
+rownames(GO_CirrvsH) <- genes_CH
+resSig_CH <- subset(GO_CirrvsH, padj < 0.05)
+resFCordered_CH <-unique(GO_CirrvsH[order(GO_CirrvsH$log2FoldChange, decreasing = TRUE),])
+sigFCordered_CH <-unique(resSig_CH[order(resSig_CH$log2FoldChange, decreasing = TRUE),])
+
+universe_CH <- resFCordered_CH[,c("log2FoldChange")]
+
+siggenes_CH <- sigFCordered_CH[abs(sigFCordered_CH$log2FoldChange) > 0,c("log2FoldChange")]
+names(universe_CH)<- rownames(resFCordered_CH)
+names(siggenes_CH)<- rownames(sigFCordered_CH[abs(sigFCordered_CH$log2FoldChange) > 0,])
+
+length(universe_CH)
+length(siggenes_CH)
+```
+
+```{r}
+GO_CirrvsNAFLD <- CirrvsNAFLD
+genes_CN <- lapply(rownames(GO_CirrvsNAFLD), function(x) unlist(strsplit(x,".", fixed=TRUE))[1])
+rownames(GO_CirrvsNAFLD) <- genes_CN
+resSig_CN <- subset(GO_CirrvsNAFLD, padj < 0.05)
+resFCordered_CN <-unique(GO_CirrvsNAFLD[order(GO_CirrvsNAFLD$log2FoldChange, decreasing = TRUE),])
+sigFCordered_CN <-unique(resSig_CN[order(resSig_CN$log2FoldChange, decreasing = TRUE),])
+
+universe_CN <- resFCordered_CN[,c("log2FoldChange")]
+
+siggenes_CN <- sigFCordered_CN[abs(sigFCordered_CN$log2FoldChange) > 0,c("log2FoldChange")]
+names(universe_CN)<- rownames(resFCordered_CN)
+names(siggenes_CN)<- rownames(sigFCordered_CN[abs(sigFCordered_CN$log2FoldChange) > 0,])
+
+length(universe_CN)
+length(siggenes_CN)
+```
+
+Analyses are made: 
+
+```{r}
+mydf_NH <- data.frame(Ensembl=names(siggenes_NH), FC=siggenes_NH)
+mydf_NH$Genes <- "Up-regulated"
+mydf_NH$Genes[mydf_NH$FC < 0] <- "Down-regulated"
+
+formula_res_NH <- compareCluster(Ensembl~Genes, 
+                              data=mydf_NH, 
+                              universe = names(universe_NH),
+                              fun="enrichGO", 
+                              OrgDb='org.Hs.eg.db',
+                              ont='BP',
+                              readable=TRUE, 
+                              pAdjustMethod = "BH", 
+                              pvalueCutoff  = 0.05, 
+                              keyType = 'ENSEMBL')
+head(formula_res_NH,40)
+```
+
+```{r}
+mydf_CH <- data.frame(Ensembl=names(siggenes_CH), FC=siggenes_CH)
+mydf_CH$Genes <- "Up-regulated"
+mydf_CH$Genes[mydf_CH$FC < 0] <- "Down-regulated"
+
+formula_res_CH <- compareCluster(Ensembl~Genes, 
+                              data=mydf_CH, 
+                              universe = names(universe_CH),
+                              fun="enrichGO", 
+                              OrgDb='org.Hs.eg.db',
+                              ont='BP',
+                              readable=TRUE, 
+                              pAdjustMethod = "BH", 
+                              pvalueCutoff  = 0.05, 
+                              keyType = 'ENSEMBL')
+
+head(formula_res_CH,1166)
+```
+
+```{r}
+mydf_CN <- data.frame(Ensembl=names(siggenes_CN), FC=siggenes_CN)
+mydf_CN$Genes <- "Up-regulated"
+mydf_CN$Genes[mydf_CN$FC < 0] <- "Down-regulated"
+
+formula_res_CN <- compareCluster(Ensembl~Genes, 
+                              data=mydf_CN, 
+                              universe = names(universe_CN),
+                              fun="enrichGO", 
+                              OrgDb='org.Hs.eg.db',
+                              ont='BP',
+                              readable=TRUE, 
+                              pAdjustMethod = "BH", 
+                              pvalueCutoff  = 0.05, 
+                              keyType = 'ENSEMBL')
+head(formula_res_CN,915)
+```
+
+Files are exported:
+
+```{r}
+export_formula_res_CH <- as_tibble(formula_res_CH) %>% dplyr::select(c(-"Cluster",-"qvalue",-"Count"))
+write_xlsx(export_formula_res_CH, "GOBP_Genes_CH_SeqCorrected.xlsx")
+```
+
+```{r}
+export_formula_res_NH <- as_tibble(formula_res_NH) %>% dplyr::select(c(-"Cluster",-"qvalue",-"Count"))
+write_xlsx(export_formula_res_NH, "GOBP_Genes_NH_SeqCorrected.xlsx")
+```
+
+```{r}
+export_formula_res_CN <- as_tibble(formula_res_CN) %>% dplyr::select(c(-"Cluster",-"qvalue",-"Count"))
+write_xlsx(export_formula_res_CN, "GOBP_Genes_CN_SeqCorrected.xlsx")
+```
+
+Publication related GOBP plots are made:
+```{r}
+GOBPplot_CH <- formula_res_CH[c(250,264,248,271,6,3), asis = T]
+export_formula_res_CH <- as_tibble(GOBPplot_CH) %>% dplyr::select(c(-"Cluster",-"qvalue",-"Count"))
+
+GOBPplot_NH <- formula_res_NH[c(32,35,7,3,1), asis = T]
+export_formula_res_NH <- as_tibble(GOBPplot_NH) %>% dplyr::select(c(-"Cluster",-"qvalue",-"Count"))
+
+GOBPplot_CN <- formula_res_CN[c(272,261,252,259,11,5), asis = T]
+export_formula_res_CN <- as_tibble(GOBPplot_CN) %>% dplyr::select(c(-"Cluster",-"qvalue",-"Count"))
+
+export_formula_res_CH$Group <- rep("Cirrhosis vs Healthy", length(export_formula_res_CH$Description))
+export_formula_res_CH$GeneFraction <- sapply(export_formula_res_CH$GeneRatio, function(x) eval(parse(text=x)))
+export_formula_res_NH$Group <- rep("NAFLD vs Healthy", length(export_formula_res_NH$Description))
+export_formula_res_NH$GeneFraction <- sapply(export_formula_res_NH$GeneRatio, function(x) eval(parse(text=x)))
+export_formula_res_CN$Group <- rep("Cirrhosis vs NAFLD", length(export_formula_res_CN$Description))
+export_formula_res_CN$GeneFraction <- sapply(export_formula_res_CN$GeneRatio, function(x) eval(parse(text=x)))
+
+export_formula_res_CH <- mutate(export_formula_res_CH, Description = fct_relevel(Description,"alpha-amino acid metabolic process", "cellular amino acid metabolic process","extracellular matrix organization","positive regulation of cell activation","activation of immune response" ,"positive regulation of leukocyte activation"))
+export_formula_res_NH <- mutate(export_formula_res_NH, Description = fct_relevel(Description, "cytoplasmic translation", "ribosome biogenesis","rRNA metabolic process","coagulation","wound healing"))
+export_formula_res_CN <- mutate(export_formula_res_CN, Description = fct_relevel(Description, "cellular amino acid metabolic process","fatty acid metabolic process", "angiogenesis", "extracellular matrix organization", "activation of immune response", "wound healing"))
+
+
+ggplot(export_formula_res_CH, aes(x = Genes, y = Description)) + 
+      geom_point(aes(size = GeneFraction, color = p.adjust), stroke = 2) +
+      scale_color_distiller(palette = "Spectral", direction = 1) +
+      ylab(NULL) +
+      xlab(NULL) +
+      facet_wrap(~Group, drop = TRUE) +
+      theme_bw(base_size = 14) +
+      theme(axis.text = element_text(color = "black", size = 12), 
+            legend.key.size = unit(0.7, 'cm'), 
+            legend.title = element_text(size=11), 
+            legend.text = element_text(size=9)) +
+      guides(size = guide_legend(order=1))
+
+ggsave(filename = "~/GOBP_CH.eps", width = 8, height=5)
+
+
+ggplot(export_formula_res_NH, aes(x = Genes, y = Description)) + 
+      geom_point(aes(size = GeneFraction, color = p.adjust), stroke = 2) +
+      scale_color_distiller(palette = "Spectral", direction = 1) +
+      ylab(NULL) +
+      xlab(NULL) +
+      facet_wrap(~Group, drop = TRUE) +
+      theme_bw(base_size = 14) +
+      theme(axis.text = element_text(color = "black", size = 12), 
+            legend.key.size = unit(0.7, 'cm'), 
+            legend.title = element_text(size=11), 
+            legend.text = element_text(size=9)) +
+      guides(size = guide_legend(order=1))
+
+ggsave(filename = "~/GOBP_NH.eps", width = 6.55, height = 4.2)
+
+ggplot(export_formula_res_CN, aes(x = Genes, y = Description)) + 
+      geom_point(aes(size = GeneFraction, color = p.adjust), stroke = 2) +
+      scale_color_distiller(palette = "Spectral", direction = 1) +
+      ylab(NULL) +
+      xlab(NULL) +
+      facet_wrap(~Group, drop = TRUE) +
+      theme_bw(base_size = 14) +
+      theme(axis.text = element_text(color = "black", size = 12), 
+            legend.key.size = unit(0.7, 'cm'), 
+            legend.title = element_text(size=11), 
+            legend.text = element_text(size=9)) +
+      guides(size = guide_legend(order=1))
+
+ggsave(filename = "~/GOBP_CN.eps", width = 7.5, height=5)
+```
+
+
+### Shiny app
+
+A for loop creating normalized counts (DESeq2) for all genes and subsequently storing them in a tibble. This is created for the shiny app. *LOONG RUN TIME*:
+
+```{r eval=FALSE, include=TRUE}
+t_box_shiny_dds <- tibble(count = 1, Group = NA, ENSEMBL = NA)
+
+for(i in rownames(dds)){
+  pCdata_box_dds <- plotCounts(dds, gene = i, intgroup = "Group", returnData =  TRUE)  %>% as_tibble() %>% add_column(ENSEMBL = i) 
+  t_box_shiny_dds <- bind_rows(x= t_box_shiny_dds, y= pCdata_box_dds)
+}
+
+t_box_shiny <- t_box_shiny[-1,]
+```
+
+Save csv files with *NAFLDvsH*, *CirrvsH*, and *CirrvsNAFLD* in addition to the plotCount data for all genes for the shiny app:
+
+```{r eval=FALSE, include=TRUE}
+Export_NAFLDvsHealthy_WOcirr_tibble <- NAFLDvsHealthy_WOcirr_tibble %>% 
+  mutate(., foldChange = 2^log2FoldChange) %>%
+  relocate(., foldChange, .after = log2FoldChange)
+
+Export_CirrvsH_tibble <- CirrvsH_tibble %>% 
+  mutate(., foldChange = 2^log2FoldChange) %>%
+  relocate(., foldChange, .after = log2FoldChange)
+
+Export_CirrvsNAFLD_tibble <- CirrvsNAFLD_tibble %>% 
+  mutate(., foldChange = 2^log2FoldChange) %>%
+  relocate(., foldChange, .after = log2FoldChange)
+
+write_csv(Export_NAFLDvsHealthy_WOcirr_tibble, file = "~/resNH_shiny.csv")
+write_csv(Export_CirrvsH_tibble, file = "~/resCH_shiny.csv")
+write_csv(Export_CirrvsNAFLD_tibble, file = "~/resCN_shiny.csv")
+write_csv(t_box_shiny_dds, "~/t_box_shiny.csv")
+write_csv(export_formula_res_CN, "~/GOBP_Genes_CN_SeqCorrected.csv")
+write_csv(export_formula_res_NH, "~/GOBP_Genes_NH_SeqCorrected.csv")
+write_csv(export_formula_res_CH, "~/GOBP_Genes_CH_SeqCorrected.csv")
+```
+
+#### Volcano Plot
+
+Publication ready volcano plots are made:
+```{r}
+cairo_ps("~/Volcano_CvsN.eps", width = 12, height = 6)
+EnhancedVolcano(Export_CirrvsNAFLD_tibble,
+                    lab = Export_CirrvsNAFLD_tibble$gene_symbol,
+                    x = 'log2FoldChange',
+                    y = 'padj',
+                    title = 'Cirrhosis vs NAFLD',
+                    pCutoff = 0.05,
+                    FCcutoff = 0.5,
+                    pointSize = 1.0,
+                    labSize = 2.0,
+                    cutoffLineWidth = 0.5,
+                    col=c('darkgray', 'darkgray', 'blue', 'red'),
+                    colAlpha = 0.75,
+                    legendLabels=c('Not sig.','','Sig. with low fold change','Sig. with high fold change'),
+                    drawConnectors = TRUE,
+                    widthConnectors = 0.5,
+                    xlim = c(-7,7),
+                    ylim = c(0,22.5))
+dev.off()
+
+cairo_ps("~/Volcano_CvsH.eps", width = 12, height = 6)
+EnhancedVolcano(Export_CirrvsH_tibble,
+                    lab = Export_CirrvsH_tibble$gene_symbol,
+                    x = 'log2FoldChange',
+                    y = 'padj',
+                    title = 'Cirrhosis vs Healthy',
+                    pCutoff = 0.05,
+                    FCcutoff = 0.5,
+                    pointSize = 1.0,
+                    labSize = 2.0,
+                    cutoffLineWidth = 0.5,
+                    col=c('darkgray', 'darkgray', 'blue', 'red'),
+                    colAlpha = 0.75,
+                    legendLabels=c('Not sig.','','Sig. with low fold change','Sig. with high fold change'),
+                    drawConnectors = TRUE,
+                    widthConnectors = 0.5,
+                    xlim = c(-7,7),
+                    ylim = c(0,36))
+dev.off()
+
+cairo_ps("~/Volcano_NvsH.eps", width = 12, height = 6)
+ EnhancedVolcano(Export_NAFLDvsHealthy_WOcirr_tibble,
+                    lab = Export_NAFLDvsHealthy_WOcirr_tibble$gene_symbol,
+                    x = 'log2FoldChange',
+                    y = 'padj',
+                    title = 'NAFLD vs Healthy',
+                    pCutoff = 0.05,
+                    FCcutoff = 0.5,
+                    pointSize = 1.0,
+                    labSize = 2.0,
+                    cutoffLineWidth = 0.5,
+                    col=c('darkgray', 'darkgray', 'blue', 'red'),
+                    colAlpha = 0.75,
+                    legendLabels=c('Not sig.','','Sig. with low fold change','Sig. with high fold change'),
+                    drawConnectors = TRUE,
+                    widthConnectors = 0.5,
+                    xlim = c(-7,9),
+                    ylim = c(0,7))
+dev.off()
+```
+
+
+### Postprandial effect within groups
+
+The effect of eating a standardized meal is evaluated using the GroupInter column in the design matrix:
+
+```{r}
+ddsPF <- dds
+ddsPF$GroupInter <- factor(ddsPF$GroupInter)
+design(ddsPF) <- formula(~ Batch + GroupInter)
+
+#To avoid issues when converging, the following code is used instead of DESeq():
+ddsPF <- estimateSizeFactors(ddsPF)
+ddsPF <- estimateDispersions(ddsPF)
+ddsPF <- nbinomWaldTest(ddsPF, maxit=500)
+```
+
+For NAFLD and Healthy:
+
+```{r}
+ddsPF_WOcirr <- dds_WOcirr
+ddsPF_WOcirr$GroupInter <- factor(ddsPF_WOcirr$GroupInter)
+design(ddsPF_WOcirr) <- formula(~ Batch + GroupInter)
+
+ddsPF_WOcirr <- DESeq(ddsPF_WOcirr)
+```
+
+The comparisons are made: 
+
+```{r}
+PvsF_Healthy <- results(ddsPF_WOcirr, contrast=c("GroupInter","Healthy_POST","Healthy_FAST"),
+                    lfcThreshold=0, alpha=0.05)
+PvsF_NAFLD <- results(ddsPF_WOcirr, contrast=c("GroupInter","NAFLD_POST","NAFLD_FAST"),
+                    lfcThreshold=0, alpha=0.05)
+PvsF_Cirrhosis <- results(ddsPF, contrast=c("GroupInter","Cirrhosis_POST","Cirrhosis_FAST"),
+                    lfcThreshold=0, alpha=0.05)
+```
+
+Summaries of the analyses are made:
+
+```{r}
+summary(PvsF_Healthy)
+summary(PvsF_NAFLD)
+summary(PvsF_Cirrhosis)
+```
+
+#### DE results:
+
+Adding symbols and gene names:
+
+```{r}
+PvsF_Healthy_tibble <- PvsF_Healthy %>%
+  as.data.frame(.) %>%
+  rownames_to_column("ENSEMBL") %>%
+  as_tibble(.)
+
+PvsF_NAFLD_tibble <- PvsF_NAFLD %>%
+  as.data.frame(.) %>%
+  rownames_to_column("ENSEMBL") %>%
+  as_tibble(.)
+
+PvsF_Cirrhosis_tibble <- PvsF_Cirrhosis %>%
+  as.data.frame(.) %>%
+  rownames_to_column("ENSEMBL") %>%
+  as_tibble(.)
+
+ens.str <- substr(rownames(PvsF_Healthy), 1, 15)
+PvsF_Healthy$symbol <- mapIds(org.Hs.eg.db,
+                     keys=ens.str,
+                     column="SYMBOL",
+                     keytype="ENSEMBL",
+                     multiVals="first")
+PvsF_Healthy$gene_id <- mapIds(org.Hs.eg.db,
+                     keys=ens.str,
+                     column="ENTREZID",
+                     keytype="ENSEMBL",
+                     multiVals="first")
+PvsF_Healthy$gene_name <- mapIds(org.Hs.eg.db,
+                     keys=ens.str,
+                     column="GENENAME",
+                     keytype="ENSEMBL",
+                     multiVals="first")
+
+ens.str <- substr(rownames(PvsF_NAFLD), 1, 15)
+PvsF_NAFLD$symbol <- mapIds(org.Hs.eg.db,
+                     keys=ens.str,
+                     column="SYMBOL",
+                     keytype="ENSEMBL",
+                     multiVals="first")
+PvsF_NAFLD$gene_id <- mapIds(org.Hs.eg.db,
+                     keys=ens.str,
+                     column="ENTREZID",
+                     keytype="ENSEMBL",
+                     multiVals="first")
+PvsF_NAFLD$gene_name <- mapIds(org.Hs.eg.db,
+                     keys=ens.str,
+                     column="GENENAME",
+                     keytype="ENSEMBL",
+                     multiVals="first")
+
+ens.str <- substr(rownames(PvsF_Cirrhosis), 1, 15)
+PvsF_Cirrhosis$symbol <- mapIds(org.Hs.eg.db,
+                     keys=ens.str,
+                     column="SYMBOL",
+                     keytype="ENSEMBL",
+                     multiVals="first")
+PvsF_Cirrhosis$gene_id <- mapIds(org.Hs.eg.db,
+                     keys=ens.str,
+                     column="ENTREZID",
+                     keytype="ENSEMBL",
+                     multiVals="first")
+PvsF_Cirrhosis$gene_name <- mapIds(org.Hs.eg.db,
+                     keys=ens.str,
+                     column="GENENAME",
+                     keytype="ENSEMBL",
+                     multiVals="first")
+
+PvsF_Healthy_tibble <- add_column(PvsF_Healthy_tibble,gene_symbol = PvsF_Healthy$symbol, .after = "ENSEMBL")
+PvsF_NAFLD_tibble <- add_column(PvsF_NAFLD_tibble,gene_symbol = PvsF_NAFLD$symbol, .after = "ENSEMBL")
+PvsF_Cirrhosis_tibble <- add_column(PvsF_Cirrhosis_tibble,gene_symbol = PvsF_Cirrhosis$symbol, .after = "ENSEMBL")
+
+PvsF_Healthy_tibble <- add_column(PvsF_Healthy_tibble,gene_name = PvsF_Healthy$gene_name, .after = "gene_symbol")
+PvsF_NAFLD_tibble <- add_column(PvsF_NAFLD_tibble,gene_name = PvsF_NAFLD$gene_name, .after = "gene_symbol")
+PvsF_Cirrhosis_tibble <- add_column(PvsF_Cirrhosis_tibble,gene_name = PvsF_Cirrhosis$gene_name, .after = "gene_symbol")
+```
+
+Assigning NA to genes with few count in the samples contrasted:
+
+```{r}
+ddsPF_NA_Healthy <- ddsPF_WOcirr
+ddsPF_NA_Healthy <-
+  ddsPF_WOcirr[, ddsPF_WOcirr$GroupInter %in% c("Healthy_FAST", "Healthy_POST")]
+ddsPF_NA_Healthy$GroupInter <-
+  droplevels(ddsPF_NA_Healthy$GroupInter)
+nc <- counts(ddsPF_NA_Healthy, normalized = TRUE)
+filter <- rowSums(nc >= 10) >= 4
+PvsF_Healthy_tibble <- PvsF_Healthy_tibble %>% mutate(pvalue = ifelse(filter, pvalue, NA),
+                                 padj = ifelse(filter, padj, NA), stat = ifelse(filter, stat, NA))
+
+
+ddsPF_NA_NAFLD <- ddsPF_WOcirr
+ddsPF_NA_NAFLD <-
+  ddsPF_WOcirr[, ddsPF_WOcirr$GroupInter %in% c("NAFLD_FAST", "NAFLD_POST")]
+ddsPF_NA_NAFLD$GroupInter <- droplevels(ddsPF_NA_NAFLD$GroupInter)
+nc <- counts(ddsPF_NA_NAFLD, normalized = TRUE)
+filter <- rowSums(nc >= 10) >= 4
+PvsF_NAFLD_tibble <- PvsF_NAFLD_tibble %>% mutate(pvalue = ifelse(filter, pvalue, NA),
+                                 padj = ifelse(filter, padj, NA), stat = ifelse(filter, stat, NA))
+
+ddsPF_NA_Cirr <- ddsPF
+ddsPF_NA_Cirr <-
+  ddsPF[, ddsPF$GroupInter %in% c("Cirrhosis_FAST", "Cirrhosis_POST")]
+ddsPF_NA_Cirr$GroupInter <- droplevels(ddsPF_NA_Cirr$GroupInter)
+nc <- counts(ddsPF_NA_Cirr, normalized = TRUE)
+filter <- rowSums(nc >= 10) >= 4
+PvsF_Cirrhosis_tibble <- PvsF_Cirrhosis_tibble %>% mutate(pvalue = ifelse(filter, pvalue, NA),
+                                 padj = ifelse(filter, padj, NA), stat = ifelse(filter, stat, NA))
+```
+
+##### Results table
+
+All differentially expressed genes (FDR < 0.05) are saved: 
+
+```{r}
+All_Sig_Genes_PvsF_Health <- arrange(PvsF_Healthy_tibble, desc(log2FoldChange)) %>% 
+  filter(., padj < 0.05) %>%
+  mutate(., foldChange = 2^log2FoldChange)
+
+write_xlsx(All_Sig_Genes_PvsF_Health, "All_Sig_Genes_PvsF_Health_SeqCorrected.xlsx")
+write_csv(All_Sig_Genes_PvsF_Health, "All_Sig_Genes_PvsF_Health_SeqCorrected.csv")
+```
+
+```{r}
+All_Sig_Genes_PvsF_NAFLD <- arrange(PvsF_NAFLD_tibble, desc(log2FoldChange)) %>% 
+  filter(., padj < 0.05) %>%
+  mutate(., foldChange = 2^log2FoldChange) 
+
+write_xlsx(All_Sig_Genes_PvsF_NAFLD, "All_Sig_Genes_PvsF_NAFLD_SeqCorrected.xlsx")
+write_csv(All_Sig_Genes_PvsF_NAFLD, "All_Sig_Genes_PvsF_NAFLD_SeqCorrected.csv")
+```
+
+
+```{r}
+All_Sig_Genes_PvsF_Cirrhosis <- arrange(PvsF_Cirrhosis_tibble, desc(log2FoldChange)) %>% 
+  filter(., padj < 0.05) %>%
+  mutate(., foldChange = 2^log2FoldChange) 
+
+write_xlsx(All_Sig_Genes_PvsF_Cirrhosis, "All_Sig_Genes_PvsF_Cirrhosis_SeqCorrected.xlsx")
+write_csv(All_Sig_Genes_PvsF_Cirrhosis, "All_Sig_Genes_PvsF_Cirrhosis_SeqCorrected.csv")
+```
+
+###Gene Ontology
+
+Gene lists are prepared for analyses:
+
+```{r}
+GO_PvsF_Healthy <- PvsF_Healthy
+genes_PF_H <- lapply(rownames(GO_PvsF_Healthy), function(x) unlist(strsplit(x,".", fixed=TRUE))[1])
+rownames(GO_PvsF_Healthy) <- genes_PF_H
+GO_PvsF_Healthy$padj <- PvsF_Healthy_tibble$padj
+resSig_PF_H <- subset(GO_PvsF_Healthy, padj < 0.05)
+resFCordered_PF_H <-unique(GO_PvsF_Healthy[order(GO_PvsF_Healthy$log2FoldChange, decreasing = TRUE),])
+sigFCordered_PF_H <-unique(resSig_PF_H[order(resSig_PF_H$log2FoldChange, decreasing = TRUE),])
+
+universe_PF_H <- resFCordered_PF_H[,c("log2FoldChange")]
+
+siggenes_PF_H <- sigFCordered_PF_H[abs(sigFCordered_PF_H$log2FoldChange) > 0,c("log2FoldChange")]
+names(universe_PF_H) <- rownames(resFCordered_PF_H)
+names(siggenes_PF_H) <- rownames(sigFCordered_PF_H[abs(sigFCordered_PF_H$log2FoldChange) > 0,])
+
+length(universe_PF_H)
+length(siggenes_PF_H)
+```
+
+
+```{r}
+GO_PvsF_NAFLD <- PvsF_NAFLD
+genes_PF_N <- lapply(rownames(GO_PvsF_NAFLD), function(x) unlist(strsplit(x,".", fixed=TRUE))[1])
+rownames(GO_PvsF_NAFLD) <- genes_PF_N
+GO_PvsF_NAFLD$padj <- PvsF_NAFLD_tibble$padj
+resSig_PF_N <- subset(GO_PvsF_NAFLD, padj < 0.05)
+resFCordered_PF_N <-unique(GO_PvsF_NAFLD[order(GO_PvsF_NAFLD$log2FoldChange, decreasing = TRUE),])
+sigFCordered_PF_N <-unique(resSig_PF_N[order(resSig_PF_N$log2FoldChange, decreasing = TRUE),])
+
+universe_PF_N <- resFCordered_PF_N[,c("log2FoldChange")]
+
+siggenes_PF_N <- sigFCordered_PF_N[abs(sigFCordered_PF_N$log2FoldChange) > 0,c("log2FoldChange")]
+names(universe_PF_N)<- rownames(resFCordered_PF_N)
+names(siggenes_PF_N)<- rownames(sigFCordered_PF_N[abs(sigFCordered_PF_N$log2FoldChange) > 0,])
+
+length(universe_PF_N)
+length(siggenes_PF_N)
+```
+
+```{r}
+GO_PvsF_Cirrhosis <- PvsF_Cirrhosis
+genes_PF_C <- lapply(rownames(GO_PvsF_Cirrhosis), function(x) unlist(strsplit(x,".", fixed=TRUE))[1])
+rownames(GO_PvsF_Cirrhosis) <- genes_PF_C
+GO_PvsF_Cirrhosis$padj <- PvsF_Cirrhosis_tibble$padj
+resSig_PF_C <- subset(GO_PvsF_Cirrhosis, padj < 0.05)
+resFCordered_PF_C <-unique(GO_PvsF_Cirrhosis[order(GO_PvsF_Cirrhosis$log2FoldChange, decreasing = TRUE),])
+sigFCordered_PF_C <-unique(resSig_PF_C[order(resSig_PF_C$log2FoldChange, decreasing = TRUE),])
+
+universe_PF_C <- resFCordered_PF_C[,c("log2FoldChange")]
+
+siggenes_PF_C <- sigFCordered_PF_C[abs(sigFCordered_PF_C$log2FoldChange) > 0,c("log2FoldChange")]
+names(universe_PF_C)<- rownames(resFCordered_PF_C)
+names(siggenes_PF_C)<- rownames(sigFCordered_PF_C[abs(sigFCordered_PF_C$log2FoldChange) > 0,])
+
+length(universe_PF_C)
+length(siggenes_PF_C)
+```
+
+Analyses are made:
+
+```{r}
+mydf_PF_H <- data.frame(Ensembl=names(siggenes_PF_H), FC=siggenes_PF_H)
+mydf_PF_H$Genes <- "Up-regulated"
+mydf_PF_H$Genes[mydf_PF_H$FC < 0] <- "Down-regulated"
+
+formula_res_PF_H <- compareCluster(Ensembl~Genes, 
+                              data=mydf_PF_H, 
+                              universe = names(universe_PF_H),
+                              fun="enrichGO", 
+                              OrgDb='org.Hs.eg.db',
+                              ont='BP',
+                              readable=TRUE, 
+                              pAdjustMethod = "BH", 
+                              pvalueCutoff  = 0.05, 
+                              keyType = 'ENSEMBL')
+head(formula_res_PF_H,14)
+```
+
+```{r}
+mydf_PF_N <- data.frame(Ensembl=names(siggenes_PF_N), FC=siggenes_PF_N)
+mydf_PF_N$Genes <- "Up-regulated"
+mydf_PF_N$Genes[mydf_PF_N$FC < 0] <- "Down-regulated"
+
+formula_res_PF_N <- compareCluster(Ensembl~Genes, 
+                              data=mydf_PF_N, 
+                              universe = names(universe_PF_N),
+                              fun="enrichGO", 
+                              OrgDb='org.Hs.eg.db',
+                              ont='BP',
+                              readable=TRUE, 
+                              pAdjustMethod = "BH", 
+                              pvalueCutoff  = 0.05, 
+                              keyType = 'ENSEMBL')
+
+head(formula_res_PF_N,64)
+```
+
+```{r}
+mydf_PF_C <- data.frame(Ensembl=names(siggenes_PF_C), FC=siggenes_PF_C)
+mydf_PF_C$Genes <- "Up-regulated"
+mydf_PF_C$Genes[mydf_PF_C$FC < 0] <- "Down-regulated"
+
+formula_res_PF_C <- compareCluster(Ensembl~Genes, 
+                              data=mydf_PF_C, 
+                              universe = names(universe_PF_C),
+                              fun="enrichGO", 
+                              OrgDb='org.Hs.eg.db',
+                              ont='BP',
+                              readable=TRUE, 
+                              pAdjustMethod = "BH", 
+                              pvalueCutoff  = 0.05, 
+                              keyType = 'ENSEMBL')
+head(formula_res_PF_C,42)
+```
+
+Files are exported:
+
+```{r}
+export_formula_res_PF_H <- as_tibble(formula_res_PF_H) %>% dplyr::select(c(-"Cluster",-"qvalue",-"Count"))
+write_xlsx(export_formula_res_PF_H, "GOBP_Genes_PF_H_SeqCorrected.xlsx")
+```
+
+```{r}
+export_formula_res_PF_N <- as_tibble(formula_res_PF_N) %>% dplyr::select(c(-"Cluster",-"qvalue",-"Count"))
+write_xlsx(export_formula_res_PF_N, "GOBP_Genes_PF_N_SeqCorrected.xlsx")
+```
+
+```{r}
+export_formula_res_PF_C <- as_tibble(formula_res_PF_C) %>% dplyr::select(c(-"Cluster",-"qvalue",-"Count"))
+write_xlsx(export_formula_res_PF_C, "GOBP_Genes_PF_C_SeqCorrected.xlsx")
+```
+
+### Shiny apps
+
+A for loop creating normalized counts (DESeq2) for all genes and subsequently storing them in a tibble. This is created for the shiny app. *LOONG RUN TIME*:
+
+```{r eval=FALSE, include=TRUE}
+t_box_shiny_ddsPF <- tibble(count = 1, GroupInter = NA, ENSEMBL = NA)
+
+for(i in rownames(ddsPF)){
+  pCdata_box_ddsPF <- plotCounts(ddsPF, gene = i, intgroup = "GroupInter", returnData =  TRUE)  %>% as_tibble() %>% add_column(ENSEMBL = i) 
+  t_box_shiny_ddsPF <- bind_rows(x= t_box_shiny_ddsPF, y= pCdata_box_ddsPF)
+}
+
+t_box_shiny_ddsPF <- t_box_shiny_ddsPF[-1,]
+
+t_box_shiny_ddsPF_cirrhosis <- filter(t_box_shiny_ddsPF, GroupInter == "Cirrhosis_FAST" | GroupInter == "Cirrhosis_POST") %>% 
+  add_column(Intervention = if_else(.$GroupInter == "Cirrhosis_POST", "Postprandial", "Fasting")) %>% select(.,-GroupInter) 
+```
+
+```{r eval=FALSE, include=TRUE}
+t_box_shiny_ddsPF_WOcirr <- tibble(count = 1, GroupInter = NA, ENSEMBL = NA)
+
+for(i in rownames(ddsPF_WOcirr)){
+  pCdata_box_ddsPF_WOcirr <- plotCounts(ddsPF_WOcirr, gene = i, intgroup = "GroupInter", returnData =  TRUE)  %>% as_tibble() %>% add_column(ENSEMBL = i) 
+  t_box_shiny_ddsPF_WOcirr <- bind_rows(x= t_box_shiny_ddsPF_WOcirr, y= pCdata_box_ddsPF_WOcirr)
+}
+
+t_box_shiny_ddsPF_WOcirr <- t_box_shiny_ddsPF_WOcirr[-1,]
+
+t_box_shiny_ddsPF_WOcirr_healthy <- filter(t_box_shiny_ddsPF_WOcirr, GroupInter == "Healthy_FAST" | GroupInter == "Healthy_POST") %>% 
+  add_column(Intervention = if_else(.$GroupInter == "Healthy_POST", "Postprandial", "Fasting")) %>% select(.,-GroupInter) 
+  
+t_box_shiny_ddsPF_WOcirr_NAFLD <- filter(t_box_shiny_ddsPF_WOcirr, GroupInter == "NAFLD_FAST" | GroupInter == "NAFLD_POST") %>% 
+  add_column(Intervention = if_else(.$GroupInter == "NAFLD_POST", "Postprandial", "Fasting")) %>% select(.,-GroupInter) 
+```
+
+Save csv files for the shinyapp:
+
+```{r eval=FALSE, include=TRUE}
+Export_PvsF_Healthy_tibble <- PvsF_Healthy_tibble %>% 
+  mutate(., foldChange = 2^log2FoldChange) %>%
+  relocate(., foldChange, .after = log2FoldChange)
+
+Export_PvsF_NAFLD_tibble <- PvsF_NAFLD_tibble %>% 
+  mutate(., foldChange = 2^log2FoldChange) %>%
+  relocate(., foldChange, .after = log2FoldChange)
+
+Export_PvsF_Cirrhosis_tibble <- PvsF_Cirrhosis_tibble %>% 
+  mutate(., foldChange = 2^log2FoldChange) %>%
+  relocate(., foldChange, .after = log2FoldChange)
+
+write_csv(Export_PvsF_Healthy_tibble, file = "~/resHealthy.csv")
+write_csv(Export_PvsF_NAFLD_tibble, file = "~/resNAFLD.csv")
+write_csv(Export_PvsF_Cirrhosis_tibble, file = "~/resCirrhosis.csv")
+write_csv(t_box_shiny_ddsPF_WOcirr_healthy, "~/shiny_box_healthy.csv")
+write_csv(t_box_shiny_ddsPF_WOcirr_NAFLD, "~/shiny_box_NAFLD.csv")
+write_csv(t_box_shiny_ddsPF_cirrhosis, "~/shiny_box_cirrhosis.csv")
+write_csv(export_formula_res_PF_H, "~/GOBP_Genes_PF_H.csv")
+write_csv(export_formula_res_PF_N, "~/GOBP_Genes_PF_N.csv")
+write_csv(export_formula_res_PF_C, "~/GOBP_Genes_PF_C.csv")
+```
+
+### Session Info
+
+```{r}
+sessionInfo()
+```
+
