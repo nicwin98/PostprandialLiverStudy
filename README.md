@@ -7,7 +7,7 @@ This repository contains the bioinformatic analyses used to analyze RNA sequenci
 - NAFLD patients under fasting conditions
 - NAFLD patients under postprandial conditions
 - Cirrhosis patients under fasting conditions
-- Healthy patients under postprandial conditions
+- Cirrhosis patients under postprandial conditions
 
 ## Data availability 
 The raw FASTQ files and the salmon quant.sf files are available in the ArrayExpress database (http://www.ebi.ac.uk/arrayexpress) under accession numbers 
