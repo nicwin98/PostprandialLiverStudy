@@ -1,4 +1,4 @@
-
+[![DOI](https://zenodo.org/badge/615819269.svg)](https://zenodo.org/badge/latestdoi/615819269)
 
 # Postprandial Liver Study
 This repository contains the bioinformatic analyses used to analyze RNA sequencing data from a study comparing human livers from:
